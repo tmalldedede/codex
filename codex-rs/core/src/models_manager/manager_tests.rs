@@ -6,6 +6,7 @@ use crate::model_provider_info::WireApi;
 use base64::Engine as _;
 use chrono::Utc;
 use codex_api::TransportError;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelsResponse;
 use core_test_support::responses::mount_models_once;
 use http::HeaderMap;
@@ -89,6 +90,7 @@ fn provider_for(base_url: String) -> ModelProviderInfo {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        models: None,
     }
 }
 
@@ -308,6 +310,28 @@ async fn refresh_available_models_sorts_by_priority() {
         1,
         "expected a single /models request"
     );
+}
+
+#[tokio::test]
+async fn provider_chat_models_are_text_only_in_picker() {
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let mut provider = provider_for("https://example.com/v1".to_string());
+    provider.wire_api = WireApi::Chat;
+    provider.models = Some(vec!["chat-only-model".to_string()]);
+    let manager = ModelsManager::with_provider_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+    );
+
+    let presets = manager.list_models(RefreshStrategy::Offline).await;
+    let preset = presets
+        .iter()
+        .find(|preset| preset.model == "chat-only-model")
+        .expect("provider model should be listed");
+
+    assert_eq!(preset.input_modalities, vec![InputModality::Text]);
 }
 
 #[tokio::test]

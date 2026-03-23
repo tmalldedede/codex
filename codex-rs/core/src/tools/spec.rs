@@ -2371,7 +2371,9 @@ pub fn create_tools_json_for_chat_completions(
             ToolSpec::LocalShell {} => {
                 // The Responses-only local_shell tool shape is not accepted by
                 // Chat Completions, so expose an equivalent function schema.
-                if let ToolSpec::Function(function) = create_shell_tool(false) {
+                if let ToolSpec::Function(function) =
+                    create_shell_tool(/*exec_permission_approvals_enabled*/ false)
+                {
                     tools_json.push(chat_completions_function_tool_json(&function));
                 }
             }

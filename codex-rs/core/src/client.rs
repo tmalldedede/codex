@@ -36,9 +36,9 @@ use crate::api_bridge::map_api_error;
 use crate::auth::UnauthorizedRecovery;
 use crate::auth_env_telemetry::AuthEnvTelemetry;
 use crate::auth_env_telemetry::collect_auth_env_telemetry;
-use codex_api::CompactClient as ApiCompactClient;
 use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
 use codex_api::ChatCompletionsOptions as ApiChatCompletionsOptions;
+use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::MemoriesClient as ApiMemoriesClient;
 use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
@@ -82,6 +82,7 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
+use serde_json::json;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -89,7 +90,6 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
-use serde_json::json;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
@@ -752,10 +752,14 @@ impl ModelClientSession {
         Ok(request)
     }
 
-    fn build_chat_request(&self, prompt: &Prompt, model_info: &ModelInfo) -> Result<serde_json::Value> {
+    fn build_chat_request(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+    ) -> Result<serde_json::Value> {
         let instructions = &prompt.base_instructions.text;
         let input = prompt.get_formatted_input();
-        let messages = build_chat_messages(instructions, input);
+        let messages = build_chat_messages(instructions, input)?;
         let tools = create_tools_json_for_chat_completions(&prompt.tools)?;
 
         let mut request = json!({
@@ -1524,7 +1528,10 @@ fn build_responses_headers(
     headers
 }
 
-fn build_chat_messages(instructions: &str, input: Vec<ResponseItem>) -> Vec<serde_json::Value> {
+fn build_chat_messages(
+    instructions: &str,
+    input: Vec<ResponseItem>,
+) -> Result<Vec<serde_json::Value>> {
     let mut messages = Vec::new();
 
     // Collect all system-level content (instructions + developer/system messages from input)
@@ -1535,12 +1542,11 @@ fn build_chat_messages(instructions: &str, input: Vec<ResponseItem>) -> Vec<serd
     }
 
     for item in &input {
-        if let ResponseItem::Message { role, content, .. } = item {
-            if role == "developer" || role == "system" {
-                if let Some(text) = content_items_to_text(content) {
-                    system_parts.push(text);
-                }
-            }
+        if let ResponseItem::Message { role, content, .. } = item
+            && (role == "developer" || role == "system")
+            && let Some(text) = content_items_to_text(content, role)?
+        {
+            system_parts.push(text);
         }
     }
 
@@ -1558,7 +1564,7 @@ fn build_chat_messages(instructions: &str, input: Vec<ResponseItem>) -> Vec<serd
                 if role == "developer" || role == "system" {
                     continue;
                 }
-                if let Some(text) = content_items_to_text(&content) {
+                if let Some(text) = content_items_to_text(&content, &role)? {
                     messages.push(json!({
                         "role": map_chat_role(&role),
                         "content": text,
@@ -1572,11 +1578,14 @@ fn build_chat_messages(instructions: &str, input: Vec<ResponseItem>) -> Vec<serd
                 ..
             } => {
                 let args = sanitize_arguments(&arguments);
-                append_tool_call(&mut messages, json!({
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": args }
-                }));
+                append_tool_call(
+                    &mut messages,
+                    json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": args }
+                    }),
+                );
             }
             ResponseItem::CustomToolCall {
                 call_id,
@@ -1585,22 +1594,31 @@ fn build_chat_messages(instructions: &str, input: Vec<ResponseItem>) -> Vec<serd
                 ..
             } => {
                 let args = sanitize_arguments(&input);
-                append_tool_call(&mut messages, json!({
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": args }
-                }));
+                append_tool_call(
+                    &mut messages,
+                    json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": args }
+                    }),
+                );
             }
             ResponseItem::LocalShellCall {
-                call_id, id, action, ..
+                call_id,
+                id,
+                action,
+                ..
             } => {
                 if let Some(call_id) = call_id.or(id) {
                     let args = serde_json::to_string(&action).unwrap_or_else(|_| "{}".to_string());
-                    append_tool_call(&mut messages, json!({
-                        "id": call_id,
-                        "type": "function",
-                        "function": { "name": "shell", "arguments": args }
-                    }));
+                    append_tool_call(
+                        &mut messages,
+                        json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": { "name": "shell", "arguments": args }
+                        }),
+                    );
                 }
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
@@ -1615,7 +1633,9 @@ fn build_chat_messages(instructions: &str, input: Vec<ResponseItem>) -> Vec<serd
                     "content": text,
                 }));
             }
-            ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
+            ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call_id,
@@ -1626,10 +1646,10 @@ fn build_chat_messages(instructions: &str, input: Vec<ResponseItem>) -> Vec<serd
         }
     }
 
-    messages
+    Ok(messages)
 }
 
-fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
+fn content_items_to_text(content: &[ContentItem], role: &str) -> Result<Option<String>> {
     let mut text_parts = Vec::new();
     for item in content {
         match item {
@@ -1638,14 +1658,18 @@ fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
                     text_parts.push(text.clone());
                 }
             }
-            ContentItem::InputImage { .. } => {}
+            ContentItem::InputImage { .. } => {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "wire_api = \"chat\" does not support image content in {role} messages yet; switch to wire_api = \"responses\" or use a text-only turn"
+                )));
+            }
         }
     }
 
     if text_parts.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(text_parts.join("\n"))
+        Ok(Some(text_parts.join("\n")))
     }
 }
 
@@ -1666,18 +1690,18 @@ fn sanitize_arguments(s: &str) -> String {
 /// This merges tool calls with the preceding assistant text message, which is
 /// required by providers like MiniMax that expect text + tool_calls in one message.
 fn append_tool_call(messages: &mut Vec<serde_json::Value>, tool_call: serde_json::Value) {
-    if let Some(last) = messages.last_mut() {
-        if last.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-            // If the assistant message already has tool_calls, append to it.
-            if let Some(arr) = last.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
-                arr.push(tool_call);
-                return;
-            }
-            // If the assistant message has no tool_calls yet, add the field.
-            if let Some(obj) = last.as_object_mut() {
-                obj.insert("tool_calls".to_string(), json!([tool_call]));
-                return;
-            }
+    if let Some(last) = messages.last_mut()
+        && last.get("role").and_then(|r| r.as_str()) == Some("assistant")
+    {
+        // If the assistant message already has tool_calls, append to it.
+        if let Some(arr) = last.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+            arr.push(tool_call);
+            return;
+        }
+        // If the assistant message has no tool_calls yet, add the field.
+        if let Some(obj) = last.as_object_mut() {
+            obj.insert("tool_calls".to_string(), json!([tool_call]));
+            return;
         }
     }
     messages.push(json!({
@@ -1692,7 +1716,10 @@ fn map_chat_role(role: &str) -> &str {
         "developer" => "system",
         "user" | "assistant" | "system" | "tool" => role,
         unknown => {
-            warn!(role = unknown, "unknown chat role, falling back to \"user\"");
+            warn!(
+                role = unknown,
+                "unknown chat role, falling back to \"user\""
+            );
             "user"
         }
     }

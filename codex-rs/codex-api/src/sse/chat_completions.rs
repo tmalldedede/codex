@@ -140,6 +140,7 @@ async fn process_chat_sse(
     let mut last_server_model: Option<String> = None;
     let mut reasoning_part_emitted = false;
     let mut active_item_emitted = false;
+    let mut saw_finish_reason = false;
 
     loop {
         let start = Instant::now();
@@ -155,17 +156,27 @@ async fn process_chat_sse(
                 return;
             }
             Ok(None) => {
-                // Stream closed normally. Some providers (e.g. MiniMax) close the
-                // connection after the last chunk instead of sending `[DONE]`.
-                // Treat this as a successful completion.
-                emit_chat_completion_items(
-                    &tx_event,
-                    &assistant_text,
-                    &tool_calls,
-                    response_id.unwrap_or_default(),
-                    usage,
-                )
-                .await;
+                // Some providers close the connection after the final chunk
+                // instead of sending `[DONE]`. Only treat EOF as success once
+                // we've observed a terminal finish_reason; otherwise this is an
+                // early disconnect that should trigger the normal retry path.
+                if saw_finish_reason {
+                    emit_chat_completion_items(
+                        &tx_event,
+                        &assistant_text,
+                        &tool_calls,
+                        response_id.unwrap_or_default(),
+                        usage,
+                        active_item_emitted,
+                    )
+                    .await;
+                } else {
+                    let _ = tx_event
+                        .send(Err(ApiError::Stream(
+                            "stream closed before final chat completion chunk".into(),
+                        )))
+                        .await;
+                }
                 return;
             }
             Err(_) => {
@@ -183,6 +194,7 @@ async fn process_chat_sse(
                 &tool_calls,
                 response_id.unwrap_or_default(),
                 usage,
+                active_item_emitted,
             )
             .await;
             return;
@@ -226,8 +238,8 @@ async fn process_chat_sse(
             // The core layer expects an OutputItemAdded before any delta events.
             // In the Responses API this comes as `response.output_item.added`;
             // for chat completions we synthesize it on the first content/reasoning chunk.
-            let needs_active = choice.delta.reasoning_details.is_some()
-                || choice.delta.content.is_some();
+            let needs_active =
+                choice.delta.reasoning_details.is_some() || choice.delta.content.is_some();
             if needs_active && !active_item_emitted {
                 let placeholder = ResponseItem::Message {
                     id: None,
@@ -265,12 +277,16 @@ async fn process_chat_sse(
             }
             if let Some(content) = choice.delta.content {
                 assistant_text.push_str(&content);
-                let _ = tx_event.send(Ok(ResponseEvent::OutputTextDelta(content))).await;
+                let _ = tx_event
+                    .send(Ok(ResponseEvent::OutputTextDelta(content)))
+                    .await;
             }
             if let Some(delta_tool_calls) = choice.delta.tool_calls {
                 merge_tool_call_deltas(&mut tool_calls, delta_tool_calls);
             }
-            let _ = choice.finish_reason;
+            if choice.finish_reason.is_some() {
+                saw_finish_reason = true;
+            }
         }
     }
 }
@@ -309,7 +325,31 @@ async fn emit_chat_completion_items(
     tool_calls: &[AggregatedToolCall],
     response_id: String,
     usage: Option<TokenUsage>,
+    assistant_item_started: bool,
 ) {
+    if !assistant_text.trim().is_empty() || assistant_item_started {
+        let mut content = Vec::new();
+        if !assistant_text.is_empty() {
+            content.push(ContentItem::OutputText {
+                text: assistant_text.to_string(),
+            });
+        }
+        let message = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content,
+            end_turn: None,
+            phase: None,
+        };
+        if tx_event
+            .send(Ok(ResponseEvent::OutputItemDone(message)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
     for (index, call) in tool_calls.iter().enumerate() {
         if call.name.trim().is_empty() {
             continue;
@@ -327,29 +367,6 @@ async fn emit_chat_completion_items(
         };
         if tx_event
             .send(Ok(ResponseEvent::OutputItemDone(item)))
-            .await
-            .is_err()
-        {
-            return;
-        }
-    }
-
-    // Only emit a standalone assistant Message when there are NO tool calls.
-    // When tool calls are present, the text was already streamed via OutputTextDelta
-    // and emitting a separate Message item would insert an extra assistant turn
-    // between the tool_call and tool result, which providers like MiniMax reject.
-    if !assistant_text.trim().is_empty() && tool_calls.is_empty() {
-        let message = ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: assistant_text.to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        };
-        if tx_event
-            .send(Ok(ResponseEvent::OutputItemDone(message)))
             .await
             .is_err()
         {
@@ -410,13 +427,27 @@ mod tests {
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         }];
 
-        emit_chat_completion_items(&tx, "done", &tool_calls, "resp_1".to_string(), None).await;
+        emit_chat_completion_items(&tx, "done", &tool_calls, "resp_1".to_string(), None, true)
+            .await;
 
         let first = rx.recv().await.expect("event").expect("ok event");
         let second = rx.recv().await.expect("event").expect("ok event");
         let third = rx.recv().await.expect("event").expect("ok event");
 
         match first {
+            ResponseEvent::OutputItemDone(ResponseItem::Message { role, content, .. }) => {
+                assert_eq!(role, "assistant");
+                assert_eq!(
+                    content,
+                    vec![ContentItem::OutputText {
+                        text: "done".to_string(),
+                    }]
+                );
+            }
+            other => panic!("unexpected first event: {other:?}"),
+        }
+
+        match second {
             ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
                 name,
                 call_id,
@@ -427,30 +458,91 @@ mod tests {
                 assert_eq!(call_id, "call_1");
                 assert_eq!(arguments, "{\"cmd\":\"pwd\"}");
             }
-            other => panic!("unexpected first event: {other:?}"),
-        }
-
-        match second {
-            ResponseEvent::OutputItemDone(ResponseItem::Message { role, content, .. }) => {
-                assert_eq!(role, "assistant");
-                assert_eq!(
-                    content,
-                    vec![ContentItem::OutputText {
-                        text: "done".to_string(),
-                    }]
-                );
-            }
             other => panic!("unexpected second event: {other:?}"),
         }
 
         match third {
-            ResponseEvent::Completed {
-                response_id,
-                ..
-            } => {
+            ResponseEvent::Completed { response_id, .. } => {
                 assert_eq!(response_id, "resp_1");
             }
             other => panic!("unexpected third event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_chat_completions_stream_reports_error_on_early_eof() {
+        use bytes::Bytes;
+        use codex_client::StreamResponse;
+        use futures::StreamExt;
+        use futures::stream;
+        use http::HeaderMap;
+        use http::StatusCode;
+
+        let body = r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+"#;
+        let stream_response = StreamResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            bytes: stream::iter(vec![Ok(Bytes::from(body))]).boxed(),
+        };
+
+        let events = spawn_chat_completions_stream(
+            stream_response,
+            Duration::from_secs(1),
+            /*telemetry*/ None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(events.first(), Some(Ok(ResponseEvent::Created))));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(ResponseEvent::OutputTextDelta(delta)) if delta == "hi"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Err(ApiError::Stream(message))
+                if message == "stream closed before final chat completion chunk"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(ResponseEvent::Completed { .. })))
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_chat_completions_stream_completes_on_eof_after_finish_reason() {
+        use bytes::Bytes;
+        use codex_client::StreamResponse;
+        use futures::StreamExt;
+        use futures::stream;
+        use http::HeaderMap;
+        use http::StatusCode;
+
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+        );
+        let stream_response = StreamResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            bytes: stream::iter(vec![Ok(Bytes::from(body))]).boxed(),
+        };
+
+        let events = spawn_chat_completions_stream(
+            stream_response,
+            Duration::from_secs(1),
+            /*telemetry*/ None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(ResponseEvent::Completed { response_id, .. }) if response_id == "chatcmpl-1"
+        )));
+        assert!(!events.iter().any(std::result::Result::is_err));
     }
 }

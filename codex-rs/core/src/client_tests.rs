@@ -2,8 +2,13 @@ use super::AuthRequestTelemetryContext;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::UnauthorizedRecoveryExecution;
+use super::build_chat_messages;
+use crate::error::CodexErr;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -114,4 +119,89 @@ fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
     assert!(auth_context.retry_after_unauthorized);
     assert_eq!(auth_context.recovery_mode, Some("managed"));
     assert_eq!(auth_context.recovery_phase, Some("refresh_token"));
+}
+
+#[test]
+fn build_chat_messages_merges_tool_calls_into_preceding_assistant_message() {
+    let messages = build_chat_messages(
+        "follow instructions",
+        vec![
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "running command".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: "{\"cmd\":\"pwd\"}".to_string(),
+                call_id: "call_1".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: FunctionCallOutputPayload::from_text("ok".to_string()),
+            },
+        ],
+    )
+    .expect("chat messages should build");
+
+    assert_eq!(
+        messages,
+        vec![
+            json!({
+                "role": "system",
+                "content": "follow instructions",
+            }),
+            json!({
+                "role": "assistant",
+                "content": "running command",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"pwd\"}",
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "ok",
+            }),
+        ]
+    );
+}
+
+#[test]
+fn build_chat_messages_rejects_image_input() {
+    let err = build_chat_messages(
+        "",
+        vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "describe this".to_string(),
+                },
+                ContentItem::InputImage {
+                    image_url: "https://example.com/image.png".to_string(),
+                },
+            ],
+            end_turn: None,
+            phase: None,
+        }],
+    )
+    .expect_err("chat wire API should reject image content");
+
+    assert!(matches!(
+        err,
+        CodexErr::InvalidRequest(message)
+            if message.contains("wire_api = \"chat\" does not support image content")
+    ));
 }

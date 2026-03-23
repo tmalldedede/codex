@@ -11,6 +11,7 @@ use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
 use crate::error::Result as CoreResult;
 use crate::model_provider_info::ModelProviderInfo;
+use crate::model_provider_info::WireApi;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::models_manager::model_info;
@@ -24,10 +25,11 @@ use codex_api::ReqwestTransport;
 use codex_api::TransportError;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationModeMask;
-use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::default_input_modalities;
 use http::HeaderMap;
 use std::collections::HashSet;
@@ -552,12 +554,12 @@ impl ModelsManager {
                 if !known_models.insert(trimmed.to_string()) {
                     return None;
                 }
-                Some(Self::model_preset_from_provider_model(trimmed))
+                Some(self.model_preset_from_provider_model(trimmed))
             })
             .collect()
     }
 
-    fn model_preset_from_provider_model(model: &str) -> ModelPreset {
+    fn model_preset_from_provider_model(&self, model: &str) -> ModelPreset {
         ModelPreset {
             id: model.to_string(),
             model: model.to_string(),
@@ -570,8 +572,15 @@ impl ModelsManager {
             upgrade: None,
             show_in_picker: true,
             supported_in_api: true,
-            input_modalities: default_input_modalities(),
+            input_modalities: self.provider_model_input_modalities(),
             availability_nux: None,
+        }
+    }
+
+    fn provider_model_input_modalities(&self) -> Vec<InputModality> {
+        match self.provider.wire_api {
+            WireApi::Chat => vec![InputModality::Text],
+            WireApi::Responses => default_input_modalities(),
         }
     }
 
