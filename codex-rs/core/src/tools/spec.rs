@@ -2331,6 +2331,74 @@ fn push_tool_spec(
     }
 }
 
+/// Returns JSON values that are compatible with Function Calling in Chat
+/// Completions APIs.
+pub fn create_tools_json_for_chat_completions(
+    tools: &[ToolSpec],
+) -> crate::error::Result<Vec<serde_json::Value>> {
+    let mut tools_json = Vec::new();
+
+    for tool in tools {
+        match tool {
+            ToolSpec::Function(function) => {
+                tools_json.push(chat_completions_function_tool_json(function));
+            }
+            ToolSpec::Freeform(freeform) => {
+                let input_description = format!(
+                    "{}\n\nSyntax: {}\n\n{}",
+                    freeform.description, freeform.format.syntax, freeform.format.definition
+                );
+                tools_json.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": freeform.name,
+                        "description": freeform.description,
+                        "strict": false,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": input_description
+                                }
+                            },
+                            "required": ["input"],
+                            "additionalProperties": false
+                        }
+                    }
+                }));
+            }
+            ToolSpec::LocalShell {} => {
+                // The Responses-only local_shell tool shape is not accepted by
+                // Chat Completions, so expose an equivalent function schema.
+                if let ToolSpec::Function(function) = create_shell_tool(false) {
+                    tools_json.push(chat_completions_function_tool_json(&function));
+                }
+            }
+            ToolSpec::WebSearch { .. }
+            | ToolSpec::ToolSearch { .. }
+            | ToolSpec::ImageGeneration { .. } => {
+                // Chat Completions only accepts function tools. Skip responses-specific
+                // tools that do not have a function equivalent.
+            }
+        }
+    }
+
+    Ok(tools_json)
+}
+
+fn chat_completions_function_tool_json(function: &ResponsesApiTool) -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": function.name,
+            "description": function.description,
+            "parameters": function.parameters,
+            "strict": function.strict,
+        }
+    })
+}
+
 pub(crate) fn mcp_tool_to_openai_tool(
     fully_qualified_name: String,
     tool: rmcp::model::Tool,

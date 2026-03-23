@@ -24,10 +24,13 @@ use codex_api::ReqwestTransport;
 use codex_api::TransportError;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::default_input_modalities;
 use http::HeaderMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -521,12 +524,55 @@ impl ModelsManager {
         remote_models.sort_by(|a, b| a.priority.cmp(&b.priority));
 
         let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
+        let provider_model_presets = self.provider_model_presets(&presets);
+        presets.extend(provider_model_presets);
         let chatgpt_mode = matches!(self.auth_manager.auth_mode(), Some(AuthMode::Chatgpt));
         presets = ModelPreset::filter_by_auth(presets, chatgpt_mode);
 
         ModelPreset::mark_default_by_picker_visibility(&mut presets);
 
         presets
+    }
+
+    fn provider_model_presets(&self, existing_presets: &[ModelPreset]) -> Vec<ModelPreset> {
+        let mut known_models: HashSet<String> = existing_presets
+            .iter()
+            .map(|preset| preset.model.clone())
+            .collect();
+        self.provider
+            .models
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|model| {
+                let trimmed = model.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if !known_models.insert(trimmed.to_string()) {
+                    return None;
+                }
+                Some(Self::model_preset_from_provider_model(trimmed))
+            })
+            .collect()
+    }
+
+    fn model_preset_from_provider_model(model: &str) -> ModelPreset {
+        ModelPreset {
+            id: model.to_string(),
+            model: model.to_string(),
+            display_name: model.to_string(),
+            description: "Configured model from the active model provider".to_string(),
+            default_reasoning_effort: ReasoningEffort::Medium,
+            supported_reasoning_efforts: Vec::new(),
+            supports_personality: false,
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+            supported_in_api: true,
+            input_modalities: default_input_modalities(),
+            availability_nux: None,
+        }
     }
 
     async fn get_remote_models(&self) -> Vec<ModelInfo> {

@@ -37,6 +37,8 @@ use crate::auth::UnauthorizedRecovery;
 use crate::auth_env_telemetry::AuthEnvTelemetry;
 use crate::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_api::CompactClient as ApiCompactClient;
+use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
+use codex_api::ChatCompletionsOptions as ApiChatCompletionsOptions;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::MemoriesClient as ApiMemoriesClient;
 use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
@@ -67,6 +69,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -86,6 +89,7 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
+use serde_json::json;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
@@ -107,6 +111,7 @@ use crate::response_debug_context::extract_response_debug_context;
 use crate::response_debug_context::extract_response_debug_context_from_api_error;
 use crate::response_debug_context::telemetry_api_error_message;
 use crate::response_debug_context::telemetry_transport_error_message;
+use crate::tools::spec::create_tools_json_for_chat_completions;
 use crate::tools::spec::create_tools_json_for_responses_api;
 use crate::util::FeedbackRequestTags;
 use crate::util::emit_feedback_auth_recovery_tags;
@@ -747,6 +752,34 @@ impl ModelClientSession {
         Ok(request)
     }
 
+    fn build_chat_request(&self, prompt: &Prompt, model_info: &ModelInfo) -> Result<serde_json::Value> {
+        let instructions = &prompt.base_instructions.text;
+        let input = prompt.get_formatted_input();
+        let messages = build_chat_messages(instructions, input);
+        let tools = create_tools_json_for_chat_completions(&prompt.tools)?;
+
+        let mut request = json!({
+            "model": model_info.slug.clone(),
+            "messages": messages,
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        });
+
+        // Attach tool definitions when available. These fields are only added
+        // conditionally because some providers reject an empty tools array.
+        if !tools.is_empty() {
+            request["tools"] = serde_json::Value::Array(tools);
+            request["tool_choice"] = json!("auto");
+            request["parallel_tool_calls"] = json!(prompt.parallel_tool_calls);
+        }
+        // NOTE: We intentionally do NOT set `reasoning_split`. MiniMax requires
+        // reasoning_details to be echoed back in multi-turn tool-call history.
+        // Omitting it keeps thinking inside `<think>` tags in content, which
+        // naturally round-trips through the conversation.
+
+        Ok(request)
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Builds shared Responses API transport options and request-body options.
     ///
@@ -1077,6 +1110,84 @@ impl ModelClientSession {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// Streams a turn via the Chat Completions API (`/v1/chat/completions`).
+    ///
+    /// `effort` and `summary` are accepted for signature compatibility with
+    /// `stream_responses_api` but are currently unused: the Chat Completions
+    /// wire format has no standard mechanism to convey reasoning effort or
+    /// summary preferences.  Providers that support thinking (e.g. MiniMax)
+    /// handle it transparently via `<think>` tags in the content.
+    async fn stream_chat_completions(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        _effort: Option<ReasoningEffortConfig>,
+        _summary: ReasoningSummaryConfig,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.auth_manager.clone();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(super::auth::AuthManager::unauthorized_recovery);
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                &client_setup.api_auth,
+                pending_retry,
+            );
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint("/chat/completions"),
+                self.client.state.auth_env_telemetry.clone(),
+            );
+            let compression = self.responses_request_compression(client_setup.auth.as_ref());
+            let responses_options = self.build_responses_options(turn_metadata_header, compression);
+
+            let options = ApiChatCompletionsOptions {
+                conversation_id: responses_options.conversation_id,
+                session_source: responses_options.session_source,
+                extra_headers: responses_options.extra_headers,
+                compression: responses_options.compression,
+            };
+            let request = self.build_chat_request(prompt, model_info)?;
+
+            let client = ApiChatCompletionsClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+
+            match client.stream_request(request, options).await {
+                Ok(stream) => {
+                    let (stream, _) = map_response_stream(stream, session_telemetry.clone());
+                    return Ok(stream);
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            session_telemetry,
+                        )
+                        .await?,
+                    );
+                    continue;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
     /// Streams a turn via the Responses API over WebSocket transport.
     #[allow(clippy::too_many_arguments)]
     #[instrument(
@@ -1333,6 +1444,17 @@ impl ModelClientSession {
                 )
                 .await
             }
+            WireApi::Chat => {
+                self.stream_chat_completions(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    turn_metadata_header,
+                )
+                .await
+            }
         }
     }
 
@@ -1400,6 +1522,180 @@ fn build_responses_headers(
         headers.insert(X_CODEX_TURN_METADATA_HEADER, header_value.clone());
     }
     headers
+}
+
+fn build_chat_messages(instructions: &str, input: Vec<ResponseItem>) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+
+    // Collect all system-level content (instructions + developer/system messages from input)
+    // into a single system message, since some providers (e.g. MiniMax) only accept one.
+    let mut system_parts = Vec::new();
+    if !instructions.trim().is_empty() {
+        system_parts.push(instructions.to_string());
+    }
+
+    for item in &input {
+        if let ResponseItem::Message { role, content, .. } = item {
+            if role == "developer" || role == "system" {
+                if let Some(text) = content_items_to_text(content) {
+                    system_parts.push(text);
+                }
+            }
+        }
+    }
+
+    if !system_parts.is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": system_parts.join("\n\n"),
+        }));
+    }
+
+    for item in input {
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                // Skip system/developer messages — already merged above.
+                if role == "developer" || role == "system" {
+                    continue;
+                }
+                if let Some(text) = content_items_to_text(&content) {
+                    messages.push(json!({
+                        "role": map_chat_role(&role),
+                        "content": text,
+                    }));
+                }
+            }
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                let args = sanitize_arguments(&arguments);
+                append_tool_call(&mut messages, json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                }));
+            }
+            ResponseItem::CustomToolCall {
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                let args = sanitize_arguments(&input);
+                append_tool_call(&mut messages, json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                }));
+            }
+            ResponseItem::LocalShellCall {
+                call_id, id, action, ..
+            } => {
+                if let Some(call_id) = call_id.or(id) {
+                    let args = serde_json::to_string(&action).unwrap_or_else(|_| "{}".to_string());
+                    append_tool_call(&mut messages, json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": "shell", "arguments": args }
+                    }));
+                }
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let text = output
+                    .text_content()
+                    .map(ToString::to_string)
+                    .or_else(|| output.body.to_text())
+                    .unwrap_or_default();
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": text,
+                }));
+            }
+            ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    messages
+}
+
+fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
+    let mut text_parts = Vec::new();
+    for item in content {
+        match item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                if !text.trim().is_empty() {
+                    text_parts.push(text.clone());
+                }
+            }
+            ContentItem::InputImage { .. } => {}
+        }
+    }
+
+    if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join("\n"))
+    }
+}
+
+/// Returns the arguments string as-is if it's valid JSON, otherwise wraps it
+/// in a `{"input": ...}` object. The Chat Completions API requires `arguments`
+/// to be a JSON **string** (not a parsed object), so the caller must use
+/// `serde_json::Value::String(result)` when inserting into the request JSON.
+fn sanitize_arguments(s: &str) -> String {
+    if serde_json::from_str::<serde_json::Value>(s).is_ok() {
+        s.to_string()
+    } else {
+        // Wrap non-JSON arguments (e.g. freeform tool input) as a JSON object
+        json!({"input": s}).to_string()
+    }
+}
+
+/// Appends a tool_call to the last assistant message, or creates a new one.
+/// This merges tool calls with the preceding assistant text message, which is
+/// required by providers like MiniMax that expect text + tool_calls in one message.
+fn append_tool_call(messages: &mut Vec<serde_json::Value>, tool_call: serde_json::Value) {
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            // If the assistant message already has tool_calls, append to it.
+            if let Some(arr) = last.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+                arr.push(tool_call);
+                return;
+            }
+            // If the assistant message has no tool_calls yet, add the field.
+            if let Some(obj) = last.as_object_mut() {
+                obj.insert("tool_calls".to_string(), json!([tool_call]));
+                return;
+            }
+        }
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": serde_json::Value::Null,
+        "tool_calls": [tool_call]
+    }));
+}
+
+fn map_chat_role(role: &str) -> &str {
+    match role {
+        "developer" => "system",
+        "user" | "assistant" | "system" | "tool" => role,
+        unknown => {
+            warn!(role = unknown, "unknown chat role, falling back to \"user\"");
+            "user"
+        }
+    }
 }
 
 fn map_response_stream<S>(
